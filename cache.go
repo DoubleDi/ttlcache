@@ -2,6 +2,7 @@ package ttlcache
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -35,7 +36,7 @@ type SimpleCache interface {
 // Cache is a synchronized map of items that can auto-expire once stale
 type Cache struct {
 	// mutex is shared for all operations that need to be safe
-	mutex sync.Mutex
+	mutex sync.RWMutex
 	// ttl is the global ttl for the cache, can be zero (is infinite)
 	ttl time.Duration
 	// actual item storage
@@ -50,11 +51,11 @@ type Cache struct {
 	priorityQueue          *priorityQueue
 	expirationNotification chan bool
 	// hasNotified is used to not schedule new expiration processing when an request is already pending.
-	hasNotified      bool
+	hasNotified      int32
 	expirationTime   time.Time
 	skipTTLExtension bool
 	shutdownSignal   chan (chan struct{})
-	isShutDown       bool
+	isShutDown       int32
 	loaderFunction   LoaderFunction
 	sizeLimit        int
 	metrics          Metrics
@@ -227,17 +228,13 @@ func (cache *Cache) cleanjob() {
 // Close calls Purge after stopping the goroutine that does ttl checking, for a clean shutdown.
 // The cache is no longer cleaning up after the first call to Close, repeated calls are safe and return ErrClosed.
 func (cache *Cache) Close() error {
-	cache.mutex.Lock()
-	if !cache.isShutDown {
-		cache.isShutDown = true
-		cache.mutex.Unlock()
+	if atomic.CompareAndSwapInt32(&cache.isShutDown, 0, 1) {
 		feedback := make(chan struct{})
 		cache.shutdownSignal <- feedback
 		<-feedback
 		close(cache.shutdownSignal)
 		cache.Purge()
 	} else {
-		cache.mutex.Unlock()
 		return ErrClosed
 	}
 	return nil
@@ -250,9 +247,7 @@ func (cache *Cache) Set(key string, data interface{}) error {
 
 // SetWithTTL is a thread-safe way to add new items to the map with individual ttl.
 func (cache *Cache) SetWithTTL(key string, data interface{}, ttl time.Duration) error {
-	cache.mutex.Lock()
-	if cache.isShutDown {
-		cache.mutex.Unlock()
+	if atomic.LoadInt32(&cache.isShutDown) == 1 {
 		return ErrClosed
 	}
 	item, exists, _ := cache.getItem(key)
@@ -321,19 +316,19 @@ func (cache *Cache) GetByLoader(key string, customLoaderFunction LoaderFunction)
 
 // GetByLoaderWithTtl can take a per key loader function (i.e. to propagate context)
 func (cache *Cache) GetByLoaderWithTtl(key string, customLoaderFunction LoaderFunction) (interface{}, time.Duration, error) {
-	cache.mutex.Lock()
-	if cache.isShutDown {
-		cache.mutex.Unlock()
+	if atomic.LoadInt32(&cache.isShutDown) == 1 {
 		return nil, 0, ErrClosed
 	}
 
-	cache.metrics.Hits++
+	atomic.AddInt64(&cache.metrics.Hits, 1)
+	cache.mutex.RLock()
 	item, exists, triggerExpirationNotification := cache.getItem(key)
+	cache.mutex.RUnlock()
 
 	var dataToReturn interface{}
 	ttlToReturn := time.Duration(0)
 	if exists {
-		cache.metrics.Retrievals++
+		atomic.AddInt64(&cache.metrics.Retrievals, 1)
 		dataToReturn = item.data
 		if !cache.skipTTLExtension {
 			ttlToReturn = item.ttl
@@ -347,7 +342,7 @@ func (cache *Cache) GetByLoaderWithTtl(key string, customLoaderFunction LoaderFu
 
 	var err error
 	if !exists {
-		cache.metrics.Misses++
+		atomic.AddInt64(&cache.metrics.Misses, 1)
 		err = ErrNotFound
 	}
 
@@ -357,7 +352,7 @@ func (cache *Cache) GetByLoaderWithTtl(key string, customLoaderFunction LoaderFu
 	}
 
 	if loaderFunction == nil || exists {
-		cache.mutex.Unlock()
+		cache.mutex.RUnlock()
 	}
 
 	if loaderFunction != nil && !exists {
@@ -374,7 +369,7 @@ func (cache *Cache) GetByLoaderWithTtl(key string, customLoaderFunction LoaderFu
 			}
 			return lr, err
 		})
-		cache.mutex.Unlock()
+		cache.mutex.RUnlock()
 		res := <-ch
 		dataToReturn = res.Val.(*loaderResult).data
 		ttlToReturn = res.Val.(*loaderResult).ttl
@@ -389,14 +384,9 @@ func (cache *Cache) GetByLoaderWithTtl(key string, customLoaderFunction LoaderFu
 }
 
 func (cache *Cache) notifyExpiration() {
-	cache.mutex.Lock()
-	if cache.hasNotified {
-		cache.mutex.Unlock()
+	if !atomic.CompareAndSwapInt32(&cache.hasNotified, 0, 1) {
 		return
 	}
-	cache.hasNotified = true
-	cache.mutex.Unlock()
-
 	cache.expirationNotification <- true
 }
 
@@ -413,13 +403,13 @@ func (cache *Cache) invokeLoader(key string, loaderFunction LoaderFunction) (dat
 
 // Remove removes an item from the cache if it exists, triggers expiration callback when set. Can return ErrNotFound if the entry was not present.
 func (cache *Cache) Remove(key string) error {
-	cache.mutex.Lock()
-	defer cache.mutex.Unlock()
-	if cache.isShutDown {
+	if atomic.LoadInt32(&cache.isShutDown) == 1 {
 		return ErrClosed
 	}
 
+	cache.mutex.RLock()
 	object, exists := cache.items[key]
+	cache.mutex.RUnlock()
 	if !exists {
 		return ErrNotFound
 	}
@@ -430,30 +420,28 @@ func (cache *Cache) Remove(key string) error {
 
 // Count returns the number of items in the cache. Returns zero when the cache has been closed.
 func (cache *Cache) Count() int {
-	cache.mutex.Lock()
-	defer cache.mutex.Unlock()
-
-	if cache.isShutDown {
+	if atomic.LoadInt32(&cache.isShutDown) == 1 {
 		return 0
 	}
+	cache.mutex.RLock()
 	length := len(cache.items)
+	cache.mutex.RUnlock()
 	return length
 }
 
 // GetKeys returns all keys of items in the cache. Returns nil when the cache has been closed.
 func (cache *Cache) GetKeys() []string {
-	cache.mutex.Lock()
-	defer cache.mutex.Unlock()
-
-	if cache.isShutDown {
+	if atomic.LoadInt32(&cache.isShutDown) == 1 {
 		return nil
 	}
+	cache.mutex.Lock()
 	keys := make([]string, len(cache.items))
 	i := 0
 	for k := range cache.items {
 		keys[i] = k
 		i++
 	}
+	cache.mutex.Unlock()
 	return keys
 }
 
@@ -534,14 +522,14 @@ func (cache *Cache) SetLoaderFunction(loader LoaderFunction) {
 
 // Purge will remove all entries
 func (cache *Cache) Purge() error {
-	cache.mutex.Lock()
-	defer cache.mutex.Unlock()
-	if cache.isShutDown {
+	if atomic.AddInt32(&cache.isShutDown) == 1 {
 		return ErrClosed
 	}
-	cache.metrics.Evicted += int64(len(cache.items))
+	atomic.AddInt64(&cache.metrics.Evicted, int64(len(cache.items)))
+	cache.mutex.Lock()
 	cache.items = make(map[string]*item)
 	cache.priorityQueue = newPriorityQueue()
+	cache.mutex.Unlock()
 	return nil
 }
 
